@@ -46,7 +46,7 @@ public class GmailSupportApp {
         Thread.currentThread().join();
     }
 
-
+    // FRESH BUILD — Inject Gmail directly, no static mutation
     public static BaseAgent createGmailAgent(Gmail gmail) {
         UnsubscriberBot tools = new UnsubscriberBot(gmail);
 
@@ -94,6 +94,40 @@ use searchEmails...
                 ))
                 .build();
 
+        LlmAgent trashAgent = LlmAgent.builder()
+                .name("trashAgent")
+                .model("gemini-2.5-flash")
+                .instruction("""
+You trash a single email. When the user asks to delete, move to trash, or remove an email,
+call the tool trashEmail with the messageId. Return a short confirmation after success.
+Do not call other tools.
+""")
+                .tools(List.of(FunctionTool.create(tools, "trashEmail")))
+                .build();
+
+        LlmAgent archiveAgent = LlmAgent.builder()
+                .name("archiveAgent")
+                .model("gemini-2.5-flash")
+                .instruction("""
+You archive a single email. When the user asks to archive, move out of inbox, or file away an email,
+call the tool archiveEmail with the messageId. Return a short confirmation after success.
+Do not call other tools.
+""")
+                .tools(List.of(FunctionTool.create(tools, "archiveEmail")))
+                .build();
+
+        LlmAgent markAsReadAgent = LlmAgent.builder()
+                .name("markAsReadAgent")
+                .model("gemini-2.5-flash")
+                .instruction("""
+You mark an email as read. When the user asks to 'mark as read', 'mark read', 'read this', or similar,
+call the tool markAsRead with the messageId. Return a short confirmation after success.
+Do not call other tools.
+""")
+                .tools(List.of(FunctionTool.create(tools, "markAsRead")))
+                .build();
+
+
         LlmAgent unSubscribe = LlmAgent.builder()
                 .name("unSubscribe")
                 .model("gemini-2.5-flash")
@@ -116,7 +150,7 @@ use searchEmails...
                 .build();
 
 
-        
+        // 2. ROOT AGENT with routing instructions (Java ADK way)
         LlmAgent router = LlmAgent.builder()
                 .name("Gmail Life Support")
                 .model("gemini-2.5-flash")
@@ -126,6 +160,14 @@ use searchEmails...
                         If the user asks to unsubscribe from anything (e.g. “unsubscribe”,\s
                                         “stop emails”, “remove me from mailing list”, “cancel newsletter”):
                                             → route to "unSubscribe".
+                        If the user asks to archive, move to archive, file away, or "put in archive":
+                               → route to "archiveAgent".
+                                                
+                        If the user asks to delete, trash, "move to trash", "delete this message", or similar:
+                               → route to "trashAgent".
+                                                
+                        If the user asks to mark as read, mark read, "mark this as read", or "read this":
+                               → route to "markAsReadAgent".
                                                 
                         If user asks about cleaning inbox, spam, organizing, unread →
                         route to "analyzer".
@@ -136,7 +178,9 @@ use searchEmails...
                         Otherwise ask clarifying questions.
                                               
                         """)
-                .subAgents(List.of(unSubscribe,   analyzer, decider, actor, lifeStory))
+                .subAgents(List.of(unSubscribe,   archiveAgent,
+                        trashAgent,
+                        markAsReadAgent,analyzer, decider, actor, lifeStory))
                 .build();
 
         return router;
