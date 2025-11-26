@@ -1,8 +1,6 @@
 package com.google.gmaillife;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-
 import com.google.adk.tools.Annotations.Schema;
 import com.google.api.services.gmail.Gmail;
 import com.google.api.services.gmail.model.*;
@@ -23,7 +21,6 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 public class UnsubscriberBot {
 
@@ -37,10 +34,11 @@ public class UnsubscriberBot {
     @Schema(name = "analyzeEmailBatch", description = "Analyze unread promotional emails")
     public Map<String, Object> analyzeEmailBatch() throws Exception {
 
-        // Query promotional emails (remove size filter)
+        // Query promotional unread emails and fetch full metadata (headers may be in payload only in full)
         ListMessagesResponse response = gmail.users().messages()
                 .list("me")
                 .setQ("category:promotions is:unread")
+                .setMaxResults(50L)
                 .execute();
 
         List<Map<String,Object>> arr = new ArrayList<>();
@@ -49,21 +47,21 @@ public class UnsubscriberBot {
             for (Message msg : response.getMessages()) {
                 Message full = gmail.users().messages()
                         .get("me", msg.getId())
-                        .setFormat("metadata")
+                        .setFormat("full") // full to get headers consistently
                         .execute();
 
                 Map<String,Object> item = new LinkedHashMap<>();
                 item.put("id", msg.getId());
                 item.put("subject", getHeader(full, "Subject"));
+                item.put("from", getHeader(full, "From"));
                 item.put("snippet", full.getSnippet());
+                item.put("date", getHeader(full, "Date"));
                 arr.add(item);
             }
         }
 
-        // Return as Map (same as searchEmails)
         return Map.of("items", arr);
     }
-
 
     @Schema(name = "trashEmail", description = "Trash an email by ID")
     public Map<String,Object> trashEmail(
@@ -95,7 +93,6 @@ public class UnsubscriberBot {
         );
     }
 
-
     @Schema(name = "archiveEmail", description = "Archive an email by ID")
     public Map<String, Object> archiveEmail(
             @Schema(description = "ID of the email to archive") String id
@@ -106,14 +103,8 @@ public class UnsubscriberBot {
 
         gmail.users().messages().modify("me", id, req).execute();
 
-        Map<String, Object> result = new LinkedHashMap<>();
-        result.put("status", "ok");
-        result.put("id", id);
-
-        return result;
+        return Map.of("status", "ok", "id", id);
     }
-
-
 
     @Schema(name = "searchEmails", description = "Search emails")
     public Map<String, Object> searchEmails(
@@ -121,10 +112,10 @@ public class UnsubscriberBot {
     ) throws Exception {
 
         if (query == null || query.isBlank()) {
-            query = "from:me";
+            query = "in:anywhere"; // safer default than from:me
         }
 
-        long maxResults = 50; // default internally
+        long maxResults = 25L;
 
         var response = gmail.users().messages().list("me")
                 .setQ(query)
@@ -137,7 +128,7 @@ public class UnsubscriberBot {
             for (var m : response.getMessages()) {
                 var full = gmail.users().messages()
                         .get("me", m.getId())
-                        .setFormat("metadata")
+                        .setFormat("full") // full to reliably get headers and body when needed
                         .execute();
 
                 Map<String,Object> email = new LinkedHashMap<>();
@@ -146,7 +137,7 @@ public class UnsubscriberBot {
                 email.put("from", getHeader(full, "From"));
                 email.put("date", getHeader(full, "Date"));
                 email.put("snippet", full.getSnippet());
-
+                // don't put full body here (avoid large payloads)
                 arr.add(email);
             }
         }
@@ -154,12 +145,10 @@ public class UnsubscriberBot {
         return Map.of("items", arr);
     }
 
-
-
     @Schema(name = "getEmail", description = "Get full email")
-    public String getEmail(String messageId) throws Exception {
+    public Map<String, Object> getEmail(String messageId) throws Exception {
 
-        Message message = gmail.users().messages().get("me", messageId).execute();
+        Message message = gmail.users().messages().get("me", messageId).setFormat("full").execute();
 
         String body = extractBody(message);
 
@@ -171,12 +160,11 @@ public class UnsubscriberBot {
         result.put("snippet", message.getSnippet());
         result.put("body", body);
 
-        return MAPPER.writeValueAsString(result);
+        return result;
     }
 
-
     @Schema(name = "getThread", description = "Get thread")
-    public String getThread(String threadId) throws Exception {
+    public Map<String, Object> getThread(String threadId) throws Exception {
 
         Thread thread = gmail.users().threads().get("me", threadId).execute();
         List<Map<String,Object>> messages = new ArrayList<>();
@@ -194,23 +182,29 @@ public class UnsubscriberBot {
             messages.add(one);
         }
 
-        return MAPPER.writeValueAsString(Map.of("items", messages));
+        return Map.of("items", messages);
     }
 
-
+    // robust header fetch
     private String getHeader(Message message, String name) {
-        if (message.getPayload() == null) return "";
-        List<MessagePartHeader> headers = message.getPayload().getHeaders();
-        if (headers == null) return "";
-        return headers.stream()
+        if (message == null || message.getPayload() == null || message.getPayload().getHeaders() == null) return "";
+        return message.getPayload().getHeaders().stream()
                 .filter(h -> name.equalsIgnoreCase(h.getName()))
                 .map(MessagePartHeader::getValue)
                 .findFirst()
                 .orElse("");
     }
 
+    // extract body: prefer HTML if possible, otherwise text
     private String extractBody(Message message) {
         try {
+            if (message == null || message.getPayload() == null) return "";
+            String html = getHtmlBodyFromMessage(message);
+            if (html != null && !html.isBlank()) {
+                // try to strip tags lightly for summary purposes
+                return Jsoup.parse(html).text();
+            }
+            // fallback to concatenating text parts
             return extractParts(message.getPayload());
         } catch (Exception e) {
             return "";
@@ -220,22 +214,27 @@ public class UnsubscriberBot {
     private String extractParts(MessagePart part) throws Exception {
         if (part == null) return "";
 
-        // If body exists
+        StringBuilder sb = new StringBuilder();
+
+        // If this part has body data
         if (part.getBody() != null && part.getBody().getData() != null) {
-            byte[] data = Base64.getUrlDecoder().decode(part.getBody().getData());
-            return new String(data);
+            try {
+                byte[] data = Base64.getUrlDecoder().decode(part.getBody().getData());
+                String decoded = new String(data, StandardCharsets.UTF_8);
+                sb.append(decoded);
+            } catch (IllegalArgumentException ignored) {
+                // ignore bad base64; continue
+            }
         }
 
-        // If multipart
+        // Recurse multipart
         if (part.getParts() != null) {
-            StringBuilder sb = new StringBuilder();
             for (MessagePart p : part.getParts()) {
                 sb.append(extractParts(p));
             }
-            return sb.toString();
         }
 
-        return "";
+        return sb.toString();
     }
 
     @Schema(name = "unsubscribeEmail", description = "Unsubscribe user from a mailing list using message ID")
@@ -243,13 +242,12 @@ public class UnsubscriberBot {
             @Schema(description = "Gmail message ID") String messageId
     ) throws Exception {
 
-        // 1) Load Gmail message
+        // 1) Load Gmail message (full required)
         Message msg = gmail.users().messages()
                 .get("me", messageId)
                 .setFormat("full")
                 .execute();
 
-        // 2) Try List-Unsubscribe header first
         String header = getHeaderIgnoreCase(msg, "List-Unsubscribe");
         System.out.println("List-Unsubscribe header = " + header);
 
@@ -268,24 +266,23 @@ public class UnsubscriberBot {
             }
         }
 
-        // 3) If header HTTP link exists, try it (highest priority)
+        // 3) Try HTTP unsubscribe (preferred)
         if (httpLink != null) {
             Map<String, Object> res = tryHttpUnsubscribe(httpLink, messageId);
             if (res != null) return res;
         }
 
-        // 4) If no header HTTP link, try to parse the HTML body to find unsubscribe links
+        // 4) Parse HTML body to find unsubscribe links
         String htmlBody = getHtmlBodyFromMessage(msg);
         if (htmlBody != null && !htmlBody.isBlank()) {
             String linkFromHtml = findUnsubscribeLinkInHtml(htmlBody);
             if (linkFromHtml != null) {
-                System.out.println("Found unsubscribe link in HTML body: " + linkFromHtml);
                 Map<String, Object> res = tryHttpUnsubscribe(linkFromHtml, messageId);
                 if (res != null) return res;
             }
         }
 
-        // 5) If header only contains mailto or we found a mailto in header, send mailto-unsubscribe via Gmail API
+        // 5) Mailto fallback (send an email)
         if (mailtoLink != null) {
             try {
                 boolean sent = sendMailtoUnsubscribe(mailtoLink);
@@ -314,8 +311,7 @@ public class UnsubscriberBot {
             }
         }
 
-        // 6) If html found a link but it was mailto or nothing worked:
-        // If html had mailto, extract it and attempt sending too
+        // 6) If HTML contained a mailto
         if (htmlBody != null && !htmlBody.isBlank()) {
             String mailtoFromHtml = findMailtoInHtml(htmlBody);
             if (mailtoFromHtml != null) {
@@ -355,7 +351,6 @@ public class UnsubscriberBot {
         );
     }
 
-
     // Try HTTP unsubscribe (GET then POST), return success map or null
     private Map<String, Object> tryHttpUnsubscribe(String urlStr, String messageId) {
         try {
@@ -370,35 +365,27 @@ public class UnsubscriberBot {
             // GET
             conn.setRequestMethod("GET");
             int code = conn.getResponseCode();
-            System.out.println("GET -> " + code + " Content-Type: " + conn.getContentType());
+            String contentType = conn.getContentType();
+            System.out.println("GET -> " + code + " Content-Type: " + contentType);
 
-            if (isConfirmedUnsub(code, conn)) {
-                return Map.of(
-                        "status", "ok",
-                        "method", "http-get",
-                        "id", messageId,
-                        "action", "unsubscribed"
-                );
+            if (isConfirmedUnsub(code, conn, contentType)) {
+                return Map.of("status", "ok", "method", "http-get", "id", messageId, "action", "unsubscribed");
             }
 
-            // POST (some endpoints require POST)
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setInstanceFollowRedirects(true);
-            conn.setConnectTimeout(8000);
-            conn.setReadTimeout(8000);
-            conn.setRequestMethod("POST");
-            conn.setDoOutput(true);
-            // Optionally write an empty body or typical form data; most endpoints accept empty POST
-            int postCode = conn.getResponseCode();
-            System.out.println("POST -> " + postCode + " Content-Type: " + conn.getContentType());
+            // POST attempt (some endpoints require POST)
+            HttpURLConnection postConn = (HttpURLConnection) url.openConnection();
+            postConn.setInstanceFollowRedirects(true);
+            postConn.setConnectTimeout(8000);
+            postConn.setReadTimeout(8000);
+            postConn.setRequestMethod("POST");
+            postConn.setDoOutput(true);
+            // Try empty POST body
+            int postCode = postConn.getResponseCode();
+            String postCT = postConn.getContentType();
+            System.out.println("POST -> " + postCode + " Content-Type: " + postCT);
 
-            if (isConfirmedUnsub(postCode, conn)) {
-                return Map.of(
-                        "status", "ok",
-                        "method", "http-post",
-                        "id", messageId,
-                        "action", "unsubscribed"
-                );
+            if (isConfirmedUnsub(postCode, postConn, postCT)) {
+                return Map.of("status", "ok", "method", "http-post", "id", messageId, "action", "unsubscribed");
             }
 
         } catch (Exception e) {
@@ -407,47 +394,57 @@ public class UnsubscriberBot {
         return null;
     }
 
-
     // Decide if response indicates a confirmed unsubscribe (avoid false positives)
-    private boolean isConfirmedUnsub(int code, HttpURLConnection conn) throws Exception {
-        if (code == 204 || code == 205) return true;
+    // Make conservative checks: 204/205 ok, JSON success ok, plain HTML only if explicit "you have been unsubscribed" visible
+    private boolean isConfirmedUnsub(int code, HttpURLConnection conn, String contentType) {
+        try {
+            if (code == 204 || code == 205) return true;
 
-        // 200 may be ok only if NOT HTML and contains JSON success or explicit keywords
-        if (code == 200) {
-            String ct = conn.getContentType();
-            if (ct != null && ct.toLowerCase().contains("text/html")) {
-                // HTML landing pages are NOT considered an automatic unsubscribe
-                return false;
-            }
+            if (code >= 300 && code < 400) return false; // redirect — not a confirmation
 
-            if (ct != null && ct.toLowerCase().contains("application/json")) {
+            if (code == 200) {
+                if (contentType != null && contentType.toLowerCase().contains("application/json")) {
+                    try (InputStream is = conn.getInputStream()) {
+                        String json = new String(is.readAllBytes(), StandardCharsets.UTF_8).toLowerCase();
+                        if (json.contains("unsubscribed") || json.contains("success") || json.contains("ok")) {
+                            return true;
+                        }
+                    } catch (Exception ignore) {}
+                }
+
+                // For HTML, be conservative: only accept if explicit phrases appear
+                if (contentType != null && contentType.toLowerCase().contains("text/html")) {
+                    try (InputStream is = conn.getInputStream()) {
+                        String body = new String(is.readAllBytes(), StandardCharsets.UTF_8).toLowerCase();
+                        if (body.contains("you have been unsubscribed") ||
+                                body.contains("successfully unsubscribed") ||
+                                body.contains("unsubscribed successfully") ||
+                                body.contains("subscription cancelled")) {
+                            return true;
+                        }
+                    } catch (Exception ignore) {}
+                    return false;
+                }
+
+                // Unknown content-type: inspect body as fallback (conservative)
                 try (InputStream is = conn.getInputStream()) {
-                    String json = new String(is.readAllBytes());
-                    String js = json.toLowerCase();
-                    if (js.contains("unsubscribed") || js.contains("success") || js.contains("ok")) {
+                    String body = new String(is.readAllBytes(), StandardCharsets.UTF_8).toLowerCase();
+                    if (body.contains("you have been unsubscribed") ||
+                            body.contains("unsubscribed successfully") ||
+                            body.contains("success")) {
                         return true;
                     }
                 } catch (Exception ignore) {}
             }
-
-            // If content-type unknown but body contains explicit keywords
-            try (InputStream is = conn.getInputStream()) {
-                String body = new String(is.readAllBytes()).toLowerCase();
-                if (body.contains("unsubscribed") || body.contains("you have been unsubscribed") || body.contains("success")) {
-                    return true;
-                }
-            } catch (Exception ignore) {}
+        } catch (Exception e) {
+            // treat failures as not confirmed
         }
-
-        // 3xx redirects -> usually not a direct confirmation, treat as false positive
         return false;
     }
 
-
-    // Build and send mailto unsubscribe as an email via Gmail API (requires Gmail send scope)
+    // Build and send mailto unsubscribe as an email via Gmail API (requires Gmail SEND scope)
     private boolean sendMailtoUnsubscribe(String mailtoLink) throws Exception {
         String to = mailtoLink.replaceFirst("mailto:", "").trim();
-        // remove parameters after ? in mailto if present (e.g. mailto:foo@bar.com?subject=...)
         int q = to.indexOf('?');
         if (q >= 0) to = to.substring(0, q);
 
@@ -457,7 +454,7 @@ public class UnsubscriberBot {
         MimeMessage mime = new MimeMessage(session);
         mime.setFrom(new InternetAddress("me"));
         mime.addRecipient(jakarta.mail.Message.RecipientType.TO, new InternetAddress(to));
-        mime.setSubject("unsubscribe");
+        mime.setSubject("Unsubscribe request");
         mime.setText("Please unsubscribe me from this mailing list.");
 
         ByteArrayOutputStream buffer = new ByteArrayOutputStream();
@@ -468,17 +465,16 @@ public class UnsubscriberBot {
         com.google.api.services.gmail.model.Message gmailMsg = new com.google.api.services.gmail.model.Message();
         gmailMsg.setRaw(encoded);
 
+        // Note: this requires Gmail API scopes that include send, otherwise this will fail.
         gmail.users().messages().send("me", gmailMsg).execute();
         return true;
     }
-
 
     // Extract HTML body from Gmail Message payload, scanning nested parts
     private String getHtmlBodyFromMessage(com.google.api.services.gmail.model.Message message) {
         if (message == null || message.getPayload() == null) return null;
 
-        // BFS through parts
-        java.util.Queue<com.google.api.services.gmail.model.MessagePart> q = new java.util.LinkedList<>();
+        Queue<com.google.api.services.gmail.model.MessagePart> q = new LinkedList<>();
         q.add(message.getPayload());
 
         while (!q.isEmpty()) {
@@ -491,11 +487,10 @@ public class UnsubscriberBot {
             if (body == null || body.getData() == null) continue;
 
             try {
-                String decoded = new String(Base64.getUrlDecoder().decode(body.getData()));
+                String decoded = new String(Base64.getUrlDecoder().decode(body.getData()), StandardCharsets.UTF_8);
                 if (mimeType != null && mimeType.toLowerCase().contains("html")) {
                     return decoded;
                 }
-                // sometimes HTML is present in text/plain with embedded HTML; still attempt
                 if (decoded.toLowerCase().contains("<html") || decoded.toLowerCase().contains("<a ")) {
                     return decoded;
                 }
@@ -504,27 +499,44 @@ public class UnsubscriberBot {
         return null;
     }
 
-
-    // Find unsubscribe HTTP link in HTML using Jsoup
+    // Find unsubscribe HTTP link in HTML using Jsoup (conservative)
     private String findUnsubscribeLinkInHtml(String html) {
         if (html == null) return null;
         try {
             Document doc = Jsoup.parse(html);
-            // common heuristics: link text contains "unsubscribe", href contains "unsubscribe", rel="unsub" etc.
             Elements anchors = doc.select("a[href]");
             for (Element a : anchors) {
                 String href = a.attr("href");
                 String text = a.text();
-                String hrefLower = href.toLowerCase();
+                String hrefLower = href == null ? "" : href.toLowerCase();
                 String textLower = text == null ? "" : text.toLowerCase();
 
-                if (hrefLower.contains("unsubscribe") || textLower.contains("unsubscribe") || a.hasAttr("rel") && a.attr("rel").toLowerCase().contains("unsub")) {
-                    // prefer http(s) href
+                boolean candidate = false;
+
+                // prefer explicit anchor text
+                if (textLower.contains("unsubscribe") || textLower.contains("opt out") || textLower.contains("manage preferences")) {
+                    candidate = true;
+                }
+                // or explicit href containing unsubscribe
+                if (hrefLower.contains("unsubscribe") || hrefLower.contains("optout") || hrefLower.contains("opt-out")) {
+                    candidate = true;
+                }
+                // rel attribute
+                if (a.hasAttr("rel") && a.attr("rel").toLowerCase().contains("unsub")) {
+                    candidate = true;
+                }
+
+                if (candidate) {
+                    // prefer http(s) links
                     if (hrefLower.startsWith("http://") || hrefLower.startsWith("https://")) {
                         return href;
                     }
-                    // sometimes href is mailto:
                     if (hrefLower.startsWith("mailto:")) return href;
+                    // sometimes links are relative; attempt to resolve absolute via base href if present (naive)
+                    String base = doc.baseUri();
+                    if (base != null && !base.isBlank() && href.startsWith("/")) {
+                        return base + href;
+                    }
                 }
             }
 
@@ -539,7 +551,6 @@ public class UnsubscriberBot {
         return null;
     }
 
-
     // Find mailto: inside HTML body (if present)
     private String findMailtoInHtml(String html) {
         if (html == null) return null;
@@ -551,7 +562,6 @@ public class UnsubscriberBot {
         return null;
     }
 
-
     // Helper: case-insensitive header lookup
     private String getHeaderIgnoreCase(com.google.api.services.gmail.model.Message msg, String name) {
         if (msg == null || msg.getPayload() == null || msg.getPayload().getHeaders() == null) return null;
@@ -562,5 +572,4 @@ public class UnsubscriberBot {
         }
         return null;
     }
-
 }

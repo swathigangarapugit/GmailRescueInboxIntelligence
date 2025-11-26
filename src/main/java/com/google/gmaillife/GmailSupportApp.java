@@ -55,8 +55,32 @@ public class GmailSupportApp {
                 .name("analyzer")
                 .model("gemini-2.5-flash")
                 .instruction("""
-You analyze unread promotional emails.
-Call the tool analyzeEmailBatch when cleaning or finding unread/promo emails.
+                        .instruction(""\"
+                                                                              You are the ANALYZER.
+                                                                              
+                                                                              YOUR JOB:
+                                                                              - Call analyzeEmailBatch exactly once.
+                                                                              - Always call it with this fixed input:
+                                                                                                          {
+                                                                                                            "query": "in:inbox newer_than:2d"
+                                                                                                          }
+                                                                              - Return ONLY the raw JSON map produced by analyzeEmailBatch.
+                                                                              - No commentary, no text, no explanations, no formatting.
+                                                                              
+                                                                              STRICT RULES:
+                                                                              1. You MUST call analyzeEmailBatch exactly once.
+                                                                              2. After the tool returns, you MUST return its JSON output EXACTLY as-is.
+                                                                              3. DO NOT add any words before or after the JSON.
+                                                                              4. DO NOT wrap it in a sentence.
+                                                                              5. DO NOT modify the fields.
+                                                                              6. DO NOT think out loud.
+                                                                              7. DO NOT call any other tools.
+                                                                              8. After returning the JSON map, STOP COMPLETELY.
+                                                                              
+                                                                              If you violate ANY of these, the system will break.
+                                                                              ""\")
+                                                                              
+
 """)
                 .tools(List.of(FunctionTool.create(tools, "analyzeEmailBatch")))
                 .build();
@@ -65,28 +89,114 @@ Call the tool analyzeEmailBatch when cleaning or finding unread/promo emails.
                 .name("decider")
                 .model("gemini-2.5-flash")
                 .instruction("""
-                        You decide trash/archive/keep for emails. If user asks about cleaning or organizing → decide actions. Otherwise, pass to next agent.""")
+You are the DECIDER.
+
+IMPORTANT:
+- DO NOT choose trash/archive/markasread yourself.
+- DO NOT guess user intent.
+- DO NOT infer or assume actions.
+- If the user did NOT explicitly say "trash", "archive", or "mark as read"
+  in THIS SAME USER MESSAGE:
+      → You MUST ask the user what action to take.
+      → You MUST include the message IDs in your question.
+      → You MUST NOT choose any actions automatically.
+
+Rules:
+1) Do NOT call any tools.
+2) Input is the Map from analyzer (email summaries).
+3) First, determine if the user explicitly requested an action:
+      - If YES → return decisions normally.
+      - If NO → return a follow-up question asking what action to perform.
+4) Output format when returning decisions:
+
+{
+ "decisions": [
+   {"id":"...", "action":"trash/archive/markasread/keep"}
+ ]
+}
+
+5) Output format when asking the user:
+
+{
+  "requires_followup": true,
+  "question": "I found these emails: [IDS]. What action should I take? (trash / archive / mark as read / keep)"
+}
+
+6) NEVER auto-select trash/archive/markasread.
+7) ALWAYS ask the user when the intent is missing.
+""")
                 .build();
+
 
         LlmAgent actor = LlmAgent.builder()
                 .name("actor")
                 .model("gemini-2.5-flash")
                 .instruction("""
-                You execute trashEmail and archiveEmail. If user asks about cleaning or organizing → execute actions. Otherwise, pass to next agent.""")
+You execute trash or archive actions.
+
+RULES:
+1) For each decision:
+   - If action=trash → call trashEmail(messageId)
+   - If action=archive → call archiveEmail(messageId)
+2) Call each tool EXACTLY ONCE if needed.
+3) Never call searchEmails or any other tools.
+
+4) After all actions, return a FINAL STRING summary:
+   "Inbox cleanup complete. Processed <N> messages."
+
+5) DO NOT return JSON, Maps, or objects.
+6) After returning the string, STOP.
+""")
                 .tools(List.of(
                         FunctionTool.create(tools, "trashEmail"),
                         FunctionTool.create(tools, "archiveEmail")
                 ))
                 .build();
 
+
+        // Multi-step deterministic flow for cleanup
+        SequentialAgent cleanupFlow = SequentialAgent.builder()
+                .name("cleanupFlow")
+                .subAgents(List.of(analyzer,decider,actor))
+                // <-- ADD THIS
+                .build();
+
         LlmAgent lifeStory = LlmAgent.builder()
                 .name("lifeStory")
                 .model("gemini-2.5-flash")
                 .instruction("""
-You are a biographer. If user asks about "life story", "timeline", 
-"biggest moments", "my journey", "personal history", "what my emails say about me" →
-use searchEmails...
-""")
+                        You are a biographer. When the user asks about "life story", "timeline",
+                        "biggest moments", "memories", "my journey", or "what my emails say about me":
+                                                
+                        RULES:
+                        1) Call searchEmails EXACTLY ONCE with a broad query such as\s
+                           "label:all newer_than:5y".
+                                                
+                        2) DO NOT call getEmail or getThread. Ignore those tools completely.
+                                                
+                        3) Use ONLY the information returned from searchEmails
+                           (subject, from, date, snippet). Do not attempt to fetch full bodies.
+                                                
+                        4) Write a readable, flowing narrative paragraph that summarizes what the
+                           user's emails say about their life — highlighting themes, milestones,
+                           patterns, or personal moments inferred from the metadata.
+                                                
+                        5) The final response must be a plain paragraph of text.
+                           No JSON. No braces. No lists. No technical formatting.
+                                                
+                        6) After generating the paragraph, STOP.\s
+                           Do not call any additional tools.\s
+                           Do not retry searchEmails.\s
+                           Do not loop.
+                                                
+                        7) After producing the final response:
+                           - DO NOT call any tool again
+                           - DO NOT retry tool calls
+                           - DO NOT attempt to expand details
+
+                        Your total tool calls must be ONE (1).
+
+                        """)
                 .tools(List.of(
                         FunctionTool.create(tools, "searchEmails"),
                         FunctionTool.create(tools, "getEmail"),
@@ -98,33 +208,49 @@ use searchEmails...
                 .name("trashAgent")
                 .model("gemini-2.5-flash")
                 .instruction("""
-You trash a single email. When the user asks to delete, move to trash, or remove an email,
-call the tool trashEmail with the messageId. Return a short confirmation after success.
-Do not call other tools.
+When user asks to delete/trash:
+
+1) Call searchEmails once.
+2) Call trashEmail(messageId) exactly once.
+3) Return a Map confirmation and STOP.
+
+No more tool calls.
+
 """)
-                .tools(List.of(FunctionTool.create(tools, "trashEmail")))
+                .tools(List.of(FunctionTool.create(tools, "searchEmails"), FunctionTool.create(tools, "trashEmail")))
                 .build();
 
         LlmAgent archiveAgent = LlmAgent.builder()
                 .name("archiveAgent")
                 .model("gemini-2.5-flash")
                 .instruction("""
-You archive a single email. When the user asks to archive, move out of inbox, or file away an email,
-call the tool archiveEmail with the messageId. Return a short confirmation after success.
-Do not call other tools.
+When user asks to archive a single message:
+
+1) Call searchEmails once to find the message.
+2) Call archiveEmail(messageId) exactly once.
+3) Return a Map confirmation and STOP.
+
+Do NOT retry tools.
+Do NOT call any extra tools.
+
 """)
-                .tools(List.of(FunctionTool.create(tools, "archiveEmail")))
+                .tools(List.of(FunctionTool.create(tools, "searchEmails"), FunctionTool.create(tools, "archiveEmail")))
                 .build();
 
         LlmAgent markAsReadAgent = LlmAgent.builder()
                 .name("markAsReadAgent")
                 .model("gemini-2.5-flash")
                 .instruction("""
-You mark an email as read. When the user asks to 'mark as read', 'mark read', 'read this', or similar,
-call the tool markAsRead with the messageId. Return a short confirmation after success.
-Do not call other tools.
+When user asks to mark an email as read:
+
+1) Call searchEmails once.
+2) Call markAsRead(messageId) exactly once.
+3) Return a Map confirmation and STOP.
+
+Do not retry or call extra tools.
+
 """)
-                .tools(List.of(FunctionTool.create(tools, "markAsRead")))
+                .tools(List.of(FunctionTool.create(tools, "searchEmails"), FunctionTool.create(tools, "markAsRead")))
                 .build();
 
 
@@ -132,21 +258,36 @@ Do not call other tools.
                 .name("unSubscribe")
                 .model("gemini-2.5-flash")
                 .instruction("""
-                You help users unsubscribe from emails.
+When user asks to unsubscribe:
 
-                When user says "unsubscribe from ___":
-                    1. Call searchEmails immediately.
-                    2. When searchEmails returns a messageId:
-                         → call unsubscribeEmail.
-                    3. If no message found:
-                         → respond normally.
+1) Call searchEmails once with the user's query.
+2) If results exist:
+   - Call unsubscribeEmail(messageId) exactly once.
+3) After the unsubscribeEmail tool call, you MUST return a final 
+   natural-language confirmation message such as:
+   "You have been unsubscribed from <sender>."
+   Do NOT return the raw result Map.
+   Do NOT end the response with a tool call.
 
-                No retries. No loops. No repeating tools.
-        """)
+Do NOT retry searchEmails.
+Do NOT loop or call any other tools.
+STOP after sending the final confirmation message.
+""")
+
                 .tools(List.of(
                         FunctionTool.create(tools, "searchEmails"),
                         FunctionTool.create(tools, "unsubscribeEmail")
                 ))
+                .build();
+
+        // Debug-friendly deterministic router with logging + clarify fallback
+        LlmAgent clarifyAgent = LlmAgent.builder()
+                .name("clarify")
+                .model("gemini-2.5-flash")
+                .instruction("""
+When the router returns "clarify", ask a single short clarifying question to the user that helps routing
+(e.g., "Do you want me to unsubscribe, archive, or delete messages?"). Return a short text answer Map: { "text": "<question>" }.
+""")
                 .build();
 
 
@@ -155,32 +296,24 @@ Do not call other tools.
                 .name("Gmail Life Support")
                 .model("gemini-2.5-flash")
                 .instruction("""
-                        You are a router agent.
-                        
-                        If the user asks to unsubscribe from anything (e.g. “unsubscribe”,\s
-                                        “stop emails”, “remove me from mailing list”, “cancel newsletter”):
-                                            → route to "unSubscribe".
-                        If the user asks to archive, move to archive, file away, or "put in archive":
-                               → route to "archiveAgent".
-                                                
-                        If the user asks to delete, trash, "move to trash", "delete this message", or similar:
-                               → route to "trashAgent".
-                                                
-                        If the user asks to mark as read, mark read, "mark this as read", or "read this":
-                               → route to "markAsReadAgent".
-                                                
-                        If user asks about cleaning inbox, spam, organizing, unread →
-                        route to "analyzer".
-                                                
-                        If user asks about life story or memories →
-                        route to "lifeStory".
-                                                
-                        Otherwise ask clarifying questions.
-                                              
-                        """)
-                .subAgents(List.of(unSubscribe,   archiveAgent,
-                        trashAgent,
-                        markAsReadAgent,analyzer, decider, actor, lifeStory))
+You are a STRICT deterministic router.
+
+IMPORTANT:
+- Only look at the USER'S ORIGINAL INPUT MESSAGE. role: user
+- Ignore any agent output, JSON, tool results, or system prompts.
+- Ignore anything that did NOT come directly from the human user.
+
+Convert ONLY the user message to lowercase and route according to:
+
+(keep your same routing rules here)
+
+Return exactly one of the following tokens:
+unSubscribe, cleanupFlow, lifeStory, archiveAgent, trashAgent, markAsReadAgent, clarify
+
+Return ONLY the token and nothing else.
+
+""")
+                .subAgents(List.of(unSubscribe, archiveAgent, trashAgent, markAsReadAgent, cleanupFlow, lifeStory, clarifyAgent))
                 .build();
 
         return router;
